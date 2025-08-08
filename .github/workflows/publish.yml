@@ -4,11 +4,11 @@ on:
   push:
     branches: [ dev ]
     paths:
-      - "**.zip"                 # auto-run when a zip changes on dev
-  workflow_dispatch:            # manual run support
+      - "**.zip"
+  workflow_dispatch:
     inputs:
       zip_file:
-        description: 'Path to the ZIP file in the repo (e.g., site.zip). If empty, use newest ZIP.'
+        description: 'Path to ZIP in repo (e.g. site.zip). Leave blank to auto-pick newest.'
         required: false
         default: ''
 
@@ -21,10 +21,11 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Checkout repo
+      - name: Checkout dev branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: dev   # <- ensure we are actually on dev for manual runs too
 
       - name: Resolve ZIP to process
         id: resolve
@@ -32,70 +33,62 @@ jobs:
         run: |
           set -e
           INPUT="${{ github.event.inputs.zip_file }}"
-          if [ -n "$INPUT" ]; then
-            # From manual trigger with input
-            if [ -f "$INPUT" ]; then
-              echo "zip_path=$INPUT" >> $GITHUB_OUTPUT
-              exit 0
-            else
-              echo "❌ Provided zip_file not found: $INPUT"
-              exit 1
-            fi
-          fi
 
-          # From push: prefer changed zip in this commit
-          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '\.zip$' || true)
-          if [ -n "$CHANGED" ]; then
-            # Take the first changed ZIP
-            ZIP_PATH=$(echo "$CHANGED" | head -n1)
-            echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
+          if [ -n "$INPUT" ]; then
+            test -f "$INPUT" || { echo "Provided zip_file not found: $INPUT"; exit 1; }
+            echo "zip_path=$INPUT" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Manual trigger *without* input: pick newest ZIP in repo
+          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '\.zip$' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "zip_path=$(echo "$CHANGED" | head -n1)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           LATEST=$(git ls-tree -r --name-only HEAD | grep -E '\.zip$' | xargs -r ls -t 2>/dev/null | head -n1 || true)
           if [ -n "$LATEST" ]; then
             echo "zip_path=$LATEST" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "No ZIP file found in repo."
           echo "zip_path=" >> $GITHUB_OUTPUT
+          echo "No ZIP file found."
+          exit 0
 
       - name: Bail if no zip found
         if: steps.resolve.outputs.zip_path == ''
-        run: |
-          echo "Nothing to do (no ZIP). Exiting."
-          exit 0
+        run: echo "Nothing to do."
 
       - name: Unzip to temp and flatten
+        if: steps.resolve.outputs.zip_path != ''
         id: unzip
         shell: bash
         run: |
           set -e
           ZIP="${{ steps.resolve.outputs.zip_path }}"
           echo "Processing ZIP: $ZIP"
-          rm -rf _unzipped
+
+          rm -rf _unzipped _unzipped_flat
           mkdir -p _unzipped
           unzip -q "$ZIP" -d _unzipped
 
-          echo "After unzip:"
-          ls -la _unzipped
-
-          # If it contains a single top-level folder, flatten it
+          # Flatten if a single top-level folder
           DIRS=$(find _unzipped -mindepth 1 -maxdepth 1 -type d | wc -l)
           FILES=$(find _unzipped -mindepth 1 -maxdepth 1 -type f | wc -l)
           if [ "$DIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
             INNER=$(find _unzipped -mindepth 1 -maxdepth 1 -type d)
-            echo "Flattening inner dir: $INNER"
             mv "$INNER" _unzipped_flat
             SRC="_unzipped_flat"
           else
             SRC="_unzipped"
           fi
           echo "src_dir=$SRC" >> $GITHUB_OUTPUT
+          echo "Flattened source: $SRC"
+          ls -la "$SRC" || true
 
       - name: Sync extracted content into repo root (overwrite-safe)
+        if: steps.unzip.outputs.src_dir != ''
         shell: bash
         run: |
           set -e
@@ -111,14 +104,21 @@ jobs:
           code=$?
           set -e
 
-          # Ignore "vanished files" (24), fail on anything else
+          # ignore "vanished files" (24), fail otherwise
           if [ "$code" -ne 0 ] && [ "$code" -ne 24 ]; then
             echo "rsync failed with code $code"
             exit "$code"
           fi
 
-          # Clean temp after sync
           rm -rf _unzipped _unzipped_flat || true
+
+      - name: Show changes (debug)
+        shell: bash
+        run: |
+          echo "---- git status ----"
+          git status
+          echo "---- diff summary ----"
+          git --no-pager diff --stat || true
 
       - name: Setup Node (only if package.json exists)
         if: hashFiles('package.json') != ''
@@ -126,11 +126,9 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install deps (tolerant)
+      - name: Install deps
         if: hashFiles('package.json') != ''
-        shell: bash
-        run: |
-          npm ci || npm install
+        run: npm ci || npm install
 
       - name: Build assets (supports build:css or build)
         if: hashFiles('package.json') != ''
@@ -141,8 +139,13 @@ jobs:
           elif npm run | grep -qE '^ *build'; then
             npm run build
           else
-            echo "No build script found; skipping."
+            echo "No build script found — skipping."
           fi
+
+      # If your .gitignore hides built files, force-add them here (uncomment):
+      # - name: Force-add build outputs
+      #   run: |
+      #     git add -f css/main.css || true
 
       - name: Commit back to dev
         shell: bash
@@ -151,9 +154,12 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Don’t commit the zip itself again
+          # Don't re-add zips
           git add -A
           git reset -- $(git ls-files -- '*.zip') 2>/dev/null || true
+
+          echo "---- post-add diff summary ----"
+          git --no-pager diff --cached --stat || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
