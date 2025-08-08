@@ -5,7 +5,7 @@ on:
     branches: [ dev ]
     paths:
       - "**.zip"
-  workflow_dispatch:    # manual trigger
+  workflow_dispatch: {}   # Manual trigger (auto-picks newest ZIP)
 
 permissions:
   contents: write
@@ -16,63 +16,97 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout repo
+      - name: Checkout dev
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: dev
 
-      - name: Find changed ZIP
-        id: findzip
+      # When pushed by ZIP change: use changed ZIP.
+      # When run manually: auto-pick the newest ZIP in the branch.
+      - name: Resolve ZIP to process
+        id: resolve
+        shell: bash
         run: |
           set -e
-          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA")
-          echo "Changed files:"
-          echo "$CHANGED"
-          ZIP_PATH=$(echo "$CHANGED" | grep -m1 -E '\.zip$' || true)
-          if [ -z "$ZIP_PATH" ]; then
-            echo "No zip found in this push. Exiting."
-            echo "zip_path=" >> $GITHUB_OUTPUT
+          # try ZIPs in this commit first (push case)
+          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '\.zip$' || true)
+          if [ -n "$CHANGED" ]; then
+            ZIP_PATH=$(echo "$CHANGED" | head -n1)
+            echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
+            echo "Using changed ZIP: $ZIP_PATH"
             exit 0
           fi
-          echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
 
-      - name: Stop if no zip (nothing to do)
-        if: steps.findzip.outputs.zip_path == ''
-        run: echo "No ZIP to process."
+          # manual run: pick newest ZIP tracked in the branch
+          LATEST=$(git ls-tree -r --name-only HEAD | grep -E '\.zip$' | xargs -r ls -t 2>/dev/null | head -n1 || true)
+          if [ -n "$LATEST" ]; then
+            echo "zip_path=$LATEST" >> $GITHUB_OUTPUT
+            echo "Using newest ZIP: $LATEST"
+            exit 0
+          fi
+
+          echo "zip_path=" >> $GITHUB_OUTPUT
+          echo "No ZIP found to process."
+
+      - name: Bail if no ZIP
+        if: steps.resolve.outputs.zip_path == ''
+        run: echo "Nothing to do."
 
       - name: Unzip into workspace
-        if: steps.findzip.outputs.zip_path != ''
+        if: steps.resolve.outputs.zip_path != ''
+        id: unzip
+        shell: bash
         run: |
           set -e
-          echo "Unzipping: ${{ steps.findzip.outputs.zip_path }}"
-          rm -rf ./_unzipped
-          mkdir -p ./_unzipped
-          unzip -q "${{ steps.findzip.outputs.zip_path }}" -d ./_unzipped
+          ZIP="${{ steps.resolve.outputs.zip_path }}"
+          echo "Unzipping: $ZIP"
+          rm -rf _unzipped _unzipped_flat
+          mkdir -p _unzipped
+          unzip -q "$ZIP" -d _unzipped
 
           echo "Contents of _unzipped:"
-          ls -la _unzipped
+          ls -la _unzipped || true
+          rm -rf _unzipped/__MACOSX || true
 
-          # If the zip contains a single top-level folder, flatten it
+          # Flatten if the zip contains a single top-level folder
           TOP_COUNT=$(find _unzipped -maxdepth 1 -mindepth 1 -type d | wc -l)
           FILE_COUNT=$(find _unzipped -maxdepth 1 -mindepth 1 -type f | wc -l)
           if [ "$TOP_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
             INNER_DIR=$(find _unzipped -maxdepth 1 -mindepth 1 -type d)
             echo "Flattening inner dir: $INNER_DIR"
-            shopt -s dotglob
-            mv "$INNER_DIR"/* .
-            shopt -u dotglob
-            rm -rf _unzipped
+            mv "$INNER_DIR" _unzipped_flat
+            echo "src_dir=_unzipped_flat" >> $GITHUB_OUTPUT
+            ls -la _unzipped_flat || true
           else
-            # Merge extracted files into repo root (overwrites files with same name)
-            echo "Merging extracted content into repo root"
-            shopt -s dotglob
-            mv -f _unzipped/* .
-            shopt -u dotglob
-            rm -rf _unzipped
+            echo "src_dir=_unzipped" >> $GITHUB_OUTPUT
           fi
 
-      - name: Setup Node
+      - name: Sync extracted content into repo root (overwrite-safe)
+        if: steps.resolve.outputs.zip_path != ''
+        shell: bash
+        run: |
+          set -e
+          SRC="${{ steps.unzip.outputs.src_dir }}"
+          echo "Syncing from: $SRC"
+
+          # rsync avoids 'Directory not empty'. Ignore exit code 24 (vanished files)
+          set +e
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='*.zip' \
+            "$SRC"/ ./
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ] && [ "$code" -ne 24 ]; then
+            echo "rsync failed with code $code"
+            exit "$code"
+          fi
+
+          rm -rf _unzipped _unzipped_flat || true
+
+      - name: Setup Node (only if package.json exists)
         if: hashFiles('package.json') != ''
         uses: actions/setup-node@v4
         with:
@@ -94,19 +128,31 @@ jobs:
             echo "No build script. Skipping build."
           fi
 
+      - name: Show changes (debug)
+        run: |
+          echo "---- git status ----"; git status
+          echo "---- diff summary ----"; git --no-pager diff --stat || true
+
       - name: Commit changes back to dev
-        if: steps.findzip.outputs.zip_path != ''
+        if: steps.resolve.outputs.zip_path != ''
+        shell: bash
         run: |
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Stage everything except zip files
           git add -A
+          git reset -- $(git ls-files -- '*.zip') 2>/dev/null || true
+
+          echo "---- staged diff summary ----"
+          git --no-pager diff --cached --stat || true
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          MSG="chore: unzip & build from ${{ steps.findzip.outputs.zip_path }} [skip ci]"
+          MSG="chore: unzip & build from ${{ steps.resolve.outputs.zip_path }} [skip ci]"
           git commit -m "$MSG"
           git push origin dev
