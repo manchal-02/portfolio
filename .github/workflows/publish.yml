@@ -4,13 +4,8 @@ on:
   push:
     branches: [ dev ]
     paths:
-      - "**.zip"                 # auto-run when a zip changes on dev
-  workflow_dispatch:            # manual run support
-    inputs:
-      zip_file:
-        description: 'Path to the ZIP file in the repo (e.g., site.zip). If empty, use newest ZIP.'
-        required: false
-        default: ''
+      - "**.zip"
+  workflow_dispatch:    # manual trigger
 
 permissions:
   contents: write
@@ -18,100 +13,66 @@ permissions:
 jobs:
   unzip-build-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: dev
 
-      - name: Resolve ZIP to process
-        id: resolve
-        shell: bash
+      - name: Find changed ZIP
+        id: findzip
         run: |
           set -e
-          INPUT="${{ github.event.inputs.zip_file }}"
-          if [ -n "$INPUT" ]; then
-            # From manual trigger with input
-            if [ -f "$INPUT" ]; then
-              echo "zip_path=$INPUT" >> $GITHUB_OUTPUT
-              exit 0
-            else
-              echo "❌ Provided zip_file not found: $INPUT"
-              exit 1
-            fi
-          fi
-
-          # From push: prefer changed zip in this commit
-          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '\.zip$' || true)
-          if [ -n "$CHANGED" ]; then
-            # Take the first changed ZIP
-            ZIP_PATH=$(echo "$CHANGED" | head -n1)
-            echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
+          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA")
+          echo "Changed files:"
+          echo "$CHANGED"
+          ZIP_PATH=$(echo "$CHANGED" | grep -m1 -E '\.zip$' || true)
+          if [ -z "$ZIP_PATH" ]; then
+            echo "No zip found in this push. Exiting."
+            echo "zip_path=" >> $GITHUB_OUTPUT
             exit 0
           fi
+          echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
 
-          # Manual trigger *without* input: pick newest ZIP in repo
-          LATEST=$(git ls-tree -r --name-only HEAD | grep -E '\.zip$' | xargs -r ls -t 2>/dev/null | head -n1 || true)
-          if [ -n "$LATEST" ]; then
-            echo "zip_path=$LATEST" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+      - name: Stop if no zip (nothing to do)
+        if: steps.findzip.outputs.zip_path == ''
+        run: echo "No ZIP to process."
 
-          echo "No ZIP file found in repo."
-          echo "zip_path=" >> $GITHUB_OUTPUT
-
-      - name: Bail if no zip found
-        if: steps.resolve.outputs.zip_path == ''
-        run: |
-          echo "Nothing to do (no ZIP). Exiting."
-          exit 0
-
-      - name: Unzip to temp and flatten
-        id: unzip
-        shell: bash
+      - name: Unzip into workspace
+        if: steps.findzip.outputs.zip_path != ''
         run: |
           set -e
-          ZIP="${{ steps.resolve.outputs.zip_path }}"
-          echo "Processing ZIP: $ZIP"
-          rm -rf _unzipped
-          mkdir -p _unzipped
-          unzip -q "$ZIP" -d _unzipped
+          echo "Unzipping: ${{ steps.findzip.outputs.zip_path }}"
+          rm -rf ./_unzipped
+          mkdir -p ./_unzipped
+          unzip -q "${{ steps.findzip.outputs.zip_path }}" -d ./_unzipped
 
-          echo "After unzip:"
+          echo "Contents of _unzipped:"
           ls -la _unzipped
 
-          # If it contains a single top-level folder, flatten it
-          DIRS=$(find _unzipped -mindepth 1 -maxdepth 1 -type d | wc -l)
-          FILES=$(find _unzipped -mindepth 1 -maxdepth 1 -type f | wc -l)
-          if [ "$DIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
-            INNER=$(find _unzipped -mindepth 1 -maxdepth 1 -type d)
-            echo "Flattening inner dir: $INNER"
-            mv "$INNER" _unzipped_flat
-            SRC="_unzipped_flat"
+          # If the zip contains a single top-level folder, flatten it
+          TOP_COUNT=$(find _unzipped -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILE_COUNT=$(find _unzipped -maxdepth 1 -mindepth 1 -type f | wc -l)
+          if [ "$TOP_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            INNER_DIR=$(find _unzipped -maxdepth 1 -mindepth 1 -type d)
+            echo "Flattening inner dir: $INNER_DIR"
+            shopt -s dotglob
+            mv "$INNER_DIR"/* .
+            shopt -u dotglob
+            rm -rf _unzipped
           else
-            SRC="_unzipped"
+            # Merge extracted files into repo root (overwrites files with same name)
+            echo "Merging extracted content into repo root"
+            shopt -s dotglob
+            mv -f _unzipped/* .
+            shopt -u dotglob
+            rm -rf _unzipped
           fi
-          echo "src_dir=$SRC" >> $GITHUB_OUTPUT
 
-      - name: Sync extracted content into repo root (overwrite-safe)
-        shell: bash
-        run: |
-          set -e
-          SRC="${{ steps.unzip.outputs.src_dir }}"
-          # Use rsync to overwrite files and avoid the "Directory not empty" error.
-          # Keep .github/ and the ZIP itself intact; remove files that no longer exist in ZIP.
-          rsync -a --delete \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='*.zip' \
-            "$SRC"/ ./
-
-          # Clean temp
-          rm -rf _unzipped _unzipped_flat || true
-
-      - name: Setup Node (only if package.json exists)
+      - name: Setup Node
         if: hashFiles('package.json') != ''
         uses: actions/setup-node@v4
         with:
@@ -119,37 +80,33 @@ jobs:
 
       - name: Install deps (tolerant)
         if: hashFiles('package.json') != ''
-        shell: bash
         run: |
           npm ci || npm install
 
-      - name: Build assets (supports build:css or build)
+      - name: Build
         if: hashFiles('package.json') != ''
-        shell: bash
         run: |
           if npm run | grep -qE '^ *build:css'; then
             npm run build:css
           elif npm run | grep -qE '^ *build'; then
             npm run build
           else
-            echo "No build script found; skipping."
+            echo "No build script. Skipping build."
           fi
 
-      - name: Commit back to dev
-        shell: bash
+      - name: Commit changes back to dev
+        if: steps.findzip.outputs.zip_path != ''
         run: |
           set -e
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Don’t commit the zip itself again
           git add -A
-          git reset -- $(git ls-files -- '*.zip') 2>/dev/null || true
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "Unzip + sync + build from ${{ steps.resolve.outputs.zip_path }} [skip ci]"
+          MSG="chore: unzip & build from ${{ steps.findzip.outputs.zip_path }} [skip ci]"
+          git commit -m "$MSG"
           git push origin dev
