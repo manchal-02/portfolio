@@ -1,0 +1,120 @@
+name: Unzip, Build, and Commit (dev)
+
+on:
+  push:
+    branches: [ dev ]
+    paths:
+      - "**.zip"          # only run when a zip is pushed/updated
+
+permissions:
+  contents: write
+
+jobs:
+  unzip-build-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # so we can diff and find which zip changed
+
+      - name: Find changed ZIP
+        id: findzip
+        run: |
+          set -e
+          # Get list of files changed in this push
+          CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA")
+          echo "Changed files:"
+          echo "$CHANGED"
+          # Pick the first .zip in the changed set (customize if you want a specific path)
+          ZIP_PATH=$(echo "$CHANGED" | grep -m1 -E '\.zip$' || true)
+          if [ -z "$ZIP_PATH" ]; then
+            echo "No zip found in this push. Exiting."
+            echo "zip_path=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
+
+      - name: Stop if no zip (nothing to do)
+        if: steps.findzip.outputs.zip_path == ''
+        run: echo "No ZIP to process."
+
+      - name: Unzip into workspace
+        if: steps.findzip.outputs.zip_path != ''
+        run: |
+          set -e
+          echo "Unzipping: ${{ steps.findzip.outputs.zip_path }}"
+          rm -rf ./_unzipped
+          mkdir -p ./_unzipped
+          unzip -q "${{ steps.findzip.outputs.zip_path }}" -d ./_unzipped
+
+          echo "Contents of _unzipped:"
+          ls -la _unzipped
+
+          # If the zip contains a single top-level folder, flatten it
+          TOP_COUNT=$(find _unzipped -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILE_COUNT=$(find _unzipped -maxdepth 1 -mindepth 1 -type f | wc -l)
+          if [ "$TOP_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            # Move inner folder contents up
+            INNER_DIR=$(find _unzipped -maxdepth 1 -mindepth 1 -type d)
+            echo "Flattening inner dir: $INNER_DIR"
+            shopt -s dotglob
+            mv "$INNER_DIR"/* .
+            shopt -u dotglob
+            rm -rf _unzipped
+          else
+            # Move all extracted files into repo root (overwriting existing)
+            echo "Merging extracted content into repo root"
+            shopt -s dotglob
+            mv -f _unzipped/* .
+            shopt -u dotglob
+            rm -rf _unzipped
+          fi
+
+      - name: Setup Node
+        if: steps.findzip.outputs.zip_path != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps (tolerant)
+        if: steps.findzip.outputs.zip_path != ''
+        run: |
+          if [ -f package-lock.json ] || [ -f package.json ]; then
+            npm ci || npm install
+          else
+            echo "No package.json found. Skipping install."
+          fi
+
+      - name: Build
+        if: steps.findzip.outputs.zip_path != ''
+        run: |
+          if [ -f package.json ]; then
+            if npm run | grep -qE '^ *build'; then
+              npm run build
+            else
+              echo "No build script. Skipping build."
+            fi
+          else
+            echo "No package.json. Skipping build."
+          fi
+
+      - name: Commit changes back to dev
+        if: steps.findzip.outputs.zip_path != ''
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Avoid re-triggering this workflow on the commit
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          MSG="chore: unzip & build from ${{ steps.findzip.outputs.zip_path }} [skip ci]"
+          git commit -m "$MSG"
+          git push origin dev
