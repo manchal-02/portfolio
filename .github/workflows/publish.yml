@@ -1,30 +1,19 @@
-name: Unzip, Build, and Commit (same branch)
+name: Unzip, Build, and Commit (dev)
 
 on:
   push:
-    branches: [ dev, main ]
+    branches: [ dev ]
     paths:
-      - "**.zip"
-  workflow_dispatch:
+      - "**.zip"                 # auto-run when a zip changes on dev
+  workflow_dispatch:            # manual run support
     inputs:
-      branch:
-        description: "Branch to operate on (default: current)"
-        required: false
-        default: ""
       zip_file:
-        description: "Path to ZIP in repo (e.g. portfolio_updated.zip). Leave blank to use newest."
+        description: 'Path to the ZIP file in the repo (e.g., site.zip). If empty, use newest ZIP.'
         required: false
-        default: ""
-      force_commit:
-        description: "Force a commit even if no diff (yes/no)"
-        required: false
-        default: "yes"
+        default: ''
 
 permissions:
   contents: write
-
-env:
-  TARGET_BRANCH: ${{ github.event.inputs.branch != '' && github.event.inputs.branch || github.ref_name }}
 
 jobs:
   unzip-build-commit:
@@ -32,11 +21,10 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Checkout target branch
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ env.TARGET_BRANCH }}
 
       - name: Resolve ZIP to process
         id: resolve
@@ -45,156 +33,123 @@ jobs:
           set -e
           INPUT="${{ github.event.inputs.zip_file }}"
           if [ -n "$INPUT" ]; then
-            test -f "$INPUT" || { echo "ZIP not found: $INPUT"; exit 1; }
-            echo "zip_path=$INPUT" >> $GITHUB_OUTPUT
-            exit 0
+            # From manual trigger with input
+            if [ -f "$INPUT" ]; then
+              echo "zip_path=$INPUT" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "❌ Provided zip_file not found: $INPUT"
+              exit 1
+            fi
           fi
 
-          # If this run was triggered by a push, grab the changed ZIP
+          # From push: prefer changed zip in this commit
           CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '\.zip$' || true)
           if [ -n "$CHANGED" ]; then
-            echo "zip_path=$(echo "$CHANGED" | head -n1)" >> $GITHUB_OUTPUT
+            # Take the first changed ZIP
+            ZIP_PATH=$(echo "$CHANGED" | head -n1)
+            echo "zip_path=$ZIP_PATH" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Otherwise pick the newest ZIP in the branch
+          # Manual trigger *without* input: pick newest ZIP in repo
           LATEST=$(git ls-tree -r --name-only HEAD | grep -E '\.zip$' | xargs -r ls -t 2>/dev/null | head -n1 || true)
           if [ -n "$LATEST" ]; then
             echo "zip_path=$LATEST" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          echo "No ZIP file found in repo."
           echo "zip_path=" >> $GITHUB_OUTPUT
-          echo "No ZIP found in repo."
-          exit 0
 
       - name: Bail if no zip found
         if: steps.resolve.outputs.zip_path == ''
-        run: echo "Nothing to do."
+        run: |
+          echo "Nothing to do (no ZIP). Exiting."
+          exit 0
 
-      - name: Unzip to temp & flatten
-        if: steps.resolve.outputs.zip_path != ''
+      - name: Unzip to temp and flatten
         id: unzip
         shell: bash
         run: |
           set -e
           ZIP="${{ steps.resolve.outputs.zip_path }}"
           echo "Processing ZIP: $ZIP"
-
-          rm -rf _unzipped _unzipped_flat
+          rm -rf _unzipped
           mkdir -p _unzipped
           unzip -q "$ZIP" -d _unzipped
 
-          # Ignore macOS junk
-          rm -rf _unzipped/__MACOSX || true
+          echo "After unzip:"
+          ls -la _unzipped
 
-          # Flatten if single top-level folder
+          # If it contains a single top-level folder, flatten it
           DIRS=$(find _unzipped -mindepth 1 -maxdepth 1 -type d | wc -l)
           FILES=$(find _unzipped -mindepth 1 -maxdepth 1 -type f | wc -l)
           if [ "$DIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
             INNER=$(find _unzipped -mindepth 1 -maxdepth 1 -type d)
+            echo "Flattening inner dir: $INNER"
             mv "$INNER" _unzipped_flat
             SRC="_unzipped_flat"
           else
             SRC="_unzipped"
           fi
-
           echo "src_dir=$SRC" >> $GITHUB_OUTPUT
-          echo "Flattened source listing:"
-          ls -la "$SRC" || true
 
-      - name: Sync into repo (overwrite-safe)
-        if: steps.unzip.outputs.src_dir != ''
+      - name: Sync extracted content into repo root (overwrite-safe)
         shell: bash
         run: |
           set -e
           SRC="${{ steps.unzip.outputs.src_dir }}"
-          echo "Syncing from: $SRC"
-
-          set +e
+          # Use rsync to overwrite files and avoid the "Directory not empty" error.
+          # Keep .github/ and the ZIP itself intact; remove files that no longer exist in ZIP.
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='*.zip' \
-            "$SRC"/ ./ 
-          code=$?
-          set -e
+            "$SRC"/ ./
 
-          # Ignore "vanished files" (24), fail otherwise
-          if [ "$code" -ne 0 ] && [ "$code" -ne 24 ]; then
-            echo "rsync failed with code $code"
-            exit "$code"
-          fi
-
+          # Clean temp
           rm -rf _unzipped _unzipped_flat || true
 
-      - name: Write stamp from ZIP hash (ensures a commit)
-        id: stamp
-        shell: bash
-        run: |
-          set -e
-          if [ "${{ github.event.inputs.force_commit }}" = "yes" ] || [ -z "${{ github.event.inputs.force_commit }}" ]; then
-            HASH=$(sha256sum "${{ steps.resolve.outputs.zip_path }}" | cut -d' ' -f1)
-            echo "$HASH" > .zip-hash
-            echo "zip_sha256=$HASH" >> $GITHUB_OUTPUT
-          else
-            echo "zip_sha256=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Show changes (debug)
-        run: |
-          echo "---- git status ----"; git status
-          echo "---- diff summary ----"; git --no-pager diff --stat || true
-
-      # Only set up Node if we actually need to build
-      - name: Setup Node (package.json or tailwind.config.js present)
-        if: hashFiles('package.json') != '' || hashFiles('tailwind.config.js') != ''
+      - name: Setup Node (only if package.json exists)
+        if: hashFiles('package.json') != ''
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: Install deps (no lockfile assumptions)
+      - name: Install deps (tolerant)
         if: hashFiles('package.json') != ''
-        run: npm install --no-audit --fund=false
-
-      - name: Build assets
-        if: hashFiles('package.json') != '' || hashFiles('tailwind.config.js') != ''
         shell: bash
         run: |
-          if [ -f package.json ] && npm run | grep -qE '^ *build:css'; then
+          npm ci || npm install
+
+      - name: Build assets (supports build:css or build)
+        if: hashFiles('package.json') != ''
+        shell: bash
+        run: |
+          if npm run | grep -qE '^ *build:css'; then
             npm run build:css
-          elif [ -f package.json ] && npm run | grep -qE '^ *build'; then
+          elif npm run | grep -qE '^ *build'; then
             npm run build
-          elif [ -f tailwind.config.js ]; then
-            npx tailwindcss -i ./css/tailwind.css -o ./css/main.css --minify
           else
-            echo "No build step required."
+            echo "No build script found; skipping."
           fi
 
-      - name: Commit changes back to same branch
+      - name: Commit back to dev
         shell: bash
         run: |
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Stage everything except zips
+          # Don’t commit the zip itself again
           git add -A
           git reset -- $(git ls-files -- '*.zip') 2>/dev/null || true
-
-          echo "---- staged diff summary ----"
-          git --no-pager diff --cached --stat || true
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          MSG="Unzip+sync+build from ${{ steps.resolve.outputs.zip_path }} [skip ci]"
-          if [ -n "${{ steps.stamp.outputs.zip_sha256 }}" ]; then
-            MSG="$MSG (zip:${{ steps.stamp.outputs.zip_sha256 }})"
-          fi
-
-          git commit -m "$MSG"
-          git push origin "${{ env.TARGET_BRANCH }}"
+          git commit -m "Unzip + sync + build from ${{ steps.resolve.outputs.zip_path }} [skip ci]"
+          git push origin dev
