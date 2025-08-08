@@ -96,6 +96,8 @@ jobs:
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='*.zip' \
+            --exclude='404.html' \
+            --exclude='CNAME' \
             "$SRC"/ ./
           code=$?
           set -e
@@ -105,6 +107,13 @@ jobs:
           fi
 
           rm -rf _unzipped _unzipped_flat || true
+
+      # Ensure a commit happens when the ZIP actually changed
+      - name: Write stamp from ZIP hash (ensures commit when ZIP differs)
+        shell: bash
+        run: |
+          HASH=$(sha256sum "${{ steps.resolve.outputs.zip_path }}" | cut -d' ' -f1)
+          echo "$HASH" > .zip-hash
 
       - name: Setup Node (only if package.json exists)
         if: hashFiles('package.json') != ''
