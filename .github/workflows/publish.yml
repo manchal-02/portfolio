@@ -2,23 +2,23 @@ name: Unzip, Build, and Commit (same branch)
 
 on:
   push:
-    branches: [ main, dev ]     # run on either branch
+    branches: [ dev, main ]
     paths:
       - "**.zip"
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to operate on (default: current)'
+        description: "Branch to operate on (default: current)"
         required: false
-        default: ''
+        default: ""
       zip_file:
-        description: 'Path to ZIP in the repo (e.g., portfolio_updated.zip). Leave blank to use newest.'
+        description: "Path to ZIP in repo (e.g. portfolio_updated.zip). Leave blank to use newest."
         required: false
-        default: ''
+        default: ""
       force_commit:
-        description: 'Write a build-stamp to guarantee a diff (yes/no)'
+        description: "Force a commit even if no diff (yes/no)"
         required: false
-        default: 'no'
+        default: "yes"
 
 permissions:
   contents: write
@@ -50,14 +50,14 @@ jobs:
             exit 0
           fi
 
-          # changed ZIPs in this commit
+          # If this run was triggered by a push, grab the changed ZIP
           CHANGED=$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '\.zip$' || true)
           if [ -n "$CHANGED" ]; then
             echo "zip_path=$(echo "$CHANGED" | head -n1)" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # newest ZIP in the branch
+          # Otherwise pick the newest ZIP in the branch
           LATEST=$(git ls-tree -r --name-only HEAD | grep -E '\.zip$' | xargs -r ls -t 2>/dev/null | head -n1 || true)
           if [ -n "$LATEST" ]; then
             echo "zip_path=$LATEST" >> $GITHUB_OUTPUT
@@ -65,7 +65,7 @@ jobs:
           fi
 
           echo "zip_path=" >> $GITHUB_OUTPUT
-          echo "No ZIP found."
+          echo "No ZIP found in repo."
           exit 0
 
       - name: Bail if no zip found
@@ -79,12 +79,16 @@ jobs:
         run: |
           set -e
           ZIP="${{ steps.resolve.outputs.zip_path }}"
-          echo "Processing: $ZIP"
+          echo "Processing ZIP: $ZIP"
 
           rm -rf _unzipped _unzipped_flat
           mkdir -p _unzipped
           unzip -q "$ZIP" -d _unzipped
 
+          # Ignore macOS junk
+          rm -rf _unzipped/__MACOSX || true
+
+          # Flatten if single top-level folder
           DIRS=$(find _unzipped -mindepth 1 -maxdepth 1 -type d | wc -l)
           FILES=$(find _unzipped -mindepth 1 -maxdepth 1 -type f | wc -l)
           if [ "$DIRS" -eq 1 ] && [ "$FILES" -eq 0 ]; then
@@ -94,7 +98,9 @@ jobs:
           else
             SRC="_unzipped"
           fi
+
           echo "src_dir=$SRC" >> $GITHUB_OUTPUT
+          echo "Flattened source listing:"
           ls -la "$SRC" || true
 
       - name: Sync into repo (overwrite-safe)
@@ -114,6 +120,7 @@ jobs:
           code=$?
           set -e
 
+          # Ignore "vanished files" (24), fail otherwise
           if [ "$code" -ne 0 ] && [ "$code" -ne 24 ]; then
             echo "rsync failed with code $code"
             exit "$code"
@@ -121,43 +128,48 @@ jobs:
 
           rm -rf _unzipped _unzipped_flat || true
 
-      - name: Optional stamp (forces a diff)
-        if: ${{ github.event.inputs.force_commit == 'yes' }}
+      - name: Write stamp from ZIP hash (ensures a commit)
+        id: stamp
+        shell: bash
         run: |
-          echo "stamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .build-stamp
+          set -e
+          if [ "${{ github.event.inputs.force_commit }}" = "yes" ] || [ -z "${{ github.event.inputs.force_commit }}" ]; then
+            HASH=$(sha256sum "${{ steps.resolve.outputs.zip_path }}" | cut -d' ' -f1)
+            echo "$HASH" > .zip-hash
+            echo "zip_sha256=$HASH" >> $GITHUB_OUTPUT
+          else
+            echo "zip_sha256=" >> $GITHUB_OUTPUT
+          fi
 
       - name: Show changes (debug)
         run: |
           echo "---- git status ----"; git status
           echo "---- diff summary ----"; git --no-pager diff --stat || true
 
-      - name: Setup Node (if package.json exists)
-        if: hashFiles('package.json') != ''
+      # Only set up Node if we actually need to build
+      - name: Setup Node (package.json or tailwind.config.js present)
+        if: hashFiles('package.json') != '' || hashFiles('tailwind.config.js') != ''
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
 
-      - name: Install deps (ci if lockfile else install)
+      - name: Install deps (no lockfile assumptions)
         if: hashFiles('package.json') != ''
-        shell: bash
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install --no-audit --fund=false
-          fi
+        run: npm install --no-audit --fund=false
 
-      - name: Build assets (build:css or build)
-        if: hashFiles('package.json') != ''
+      - name: Build assets
+        if: hashFiles('package.json') != '' || hashFiles('tailwind.config.js') != ''
         shell: bash
         run: |
-          if npm run | grep -qE '^ *build:css'; then
+          if [ -f package.json ] && npm run | grep -qE '^ *build:css'; then
             npm run build:css
-          elif npm run | grep -qE '^ *build'; then
+          elif [ -f package.json ] && npm run | grep -qE '^ *build'; then
             npm run build
+          elif [ -f tailwind.config.js ]; then
+            npx tailwindcss -i ./css/tailwind.css -o ./css/main.css --minify
           else
-            echo "No build script; skipping."
+            echo "No build step required."
           fi
 
       - name: Commit changes back to same branch
@@ -167,6 +179,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Stage everything except zips
           git add -A
           git reset -- $(git ls-files -- '*.zip') 2>/dev/null || true
 
@@ -178,5 +191,10 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Unzip+sync+build from ${{ steps.resolve.outputs.zip_path }} [skip ci]"
+          MSG="Unzip+sync+build from ${{ steps.resolve.outputs.zip_path }} [skip ci]"
+          if [ -n "${{ steps.stamp.outputs.zip_sha256 }}" ]; then
+            MSG="$MSG (zip:${{ steps.stamp.outputs.zip_sha256 }})"
+          fi
+
+          git commit -m "$MSG"
           git push origin "${{ env.TARGET_BRANCH }}"
