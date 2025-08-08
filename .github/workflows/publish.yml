@@ -100,15 +100,24 @@ jobs:
         run: |
           set -e
           SRC="${{ steps.unzip.outputs.src_dir }}"
-          # Use rsync to overwrite files and avoid the "Directory not empty" error.
-          # Keep .github/ and the ZIP itself intact; remove files that no longer exist in ZIP.
+          echo "Syncing from: $SRC"
+
+          set +e
           rsync -a --delete \
             --exclude='.git/' \
             --exclude='.github/' \
             --exclude='*.zip' \
-            "$SRC"/ ./
+            "$SRC"/ ./ 
+          code=$?
+          set -e
 
-          # Clean temp
+          # Ignore "vanished files" (24), fail on anything else
+          if [ "$code" -ne 0 ] && [ "$code" -ne 24 ]; then
+            echo "rsync failed with code $code"
+            exit "$code"
+          fi
+
+          # Clean temp after sync
           rm -rf _unzipped _unzipped_flat || true
 
       - name: Setup Node (only if package.json exists)
